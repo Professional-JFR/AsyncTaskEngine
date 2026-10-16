@@ -1,162 +1,179 @@
-# A.I. Incident Triage Copilot
+# AsyncTaskEngine
 
-An **A.I.-assisted incident triage backend** that analyzes incident text, predicts severity, suggests likely duplicates, and recommends a runbook.  
-Built for practical backend + AI workflow demonstration using **Python/FastAPI**, **PostgreSQL**, **Redis**, and **Docker**.
+This repository currently contains a synchronous incident-triage API, rather than a
+background task queue or webhook dispatcher. It accepts incident details, applies
+transparent rule-based triage, and stores the result in PostgreSQL with a best-effort
+Redis cache.
 
-## Tech Stack
-- **Python**
-- **FastAPI**
-- **PostgreSQL**
-- **Redis**
-- **Docker / Docker Compose**
-- **Pytest**
+## Architecture
 
-## Features
-- **Health & readiness checks** for operational validation
-- **Incident triage endpoint** with A.I.-style decision support
-- **Severity prediction** from incident title/description
-- **Duplicate detection** against recent incidents
-- **Runbook recommendation** based on incident context
-- **Persistent incident storage** + retrieval by `incident_id`
-
-## API Endpoints
-
-### `GET /health`
-Liveness check.
-
-**Example response**
-```json
-{"status":"ok"}
+```text
+HTTP client
+    └── FastAPI (app/main.py)
+          ├── validates request and assigns a request ID
+          ├── triage rules (app/triage.py)
+          └── storage functions (app/storage.py)
+                ├── PostgreSQL: durable incident records
+                └── Redis: optional incident cache
 ```
 
-### `GET /ready`
-Readiness check for API dependencies.
+- `app/main.py` exposes health, readiness, triage, and incident-retrieval endpoints.
+- `app/schemas.py` validates incoming incident fields and shapes successful responses.
+- `app/config.py` reads and validates environment-based settings.
+- `app/storage.py` owns PostgreSQL access, bounded transient retries, and best-effort caching.
+- `app/triage.py` contains deterministic severity, duplicate, and runbook rules.
+- `app/logging_config.py` emits JSON logs with request IDs and lifecycle fields.
 
-**Example response**
-```json
-{"status":"ready","database":"ok","redis":"ok"}
-```
+The triage rules are deliberately simple and do not call an external AI service. The API
+does not currently provide authentication, asynchronous workers, webhook delivery,
+distributed tracing, or a metrics endpoint. Put it behind an authenticated, TLS-enabled
+gateway before exposing it to an untrusted network.
 
-### `POST /incidents/triage`
-Triages an incident and stores result.
+## Run locally
 
-**Request body**
-```json
-{
-  "title": "Payment API latency spike",
-  "description": "Timeouts and degraded checkout responses",
-  "service": "payments-api",
-  "source": "monitoring"
-}
-```
+Use Python 3.11 or newer and have PostgreSQL and Redis available. Set connection
+environment variables (see [Configuration](#configuration)), then run:
 
-**Example response**
-```json
-{
-  "incident_id": "INC-3003131B",
-  "predicted_severity": "high",
-  "duplicate_of": "INC-7D962A80",
-  "runbook_suggestion": "RB-002: Validate payment gateway and API error rates",
-  "status": "triaged"
-}
-```
-
-### `GET /incidents/{incident_id}`
-Returns stored incident data + triage output.
-
----
-
-## Quick Start
-
-### 1) Clone
 ```bash
-git clone https://github.com/Professional-JFR/A.I.-Incident-Triage.git
-cd A.I.-Incident-Triage
+python -m pip install -r requirements.txt
+uvicorn app.main:app --reload
 ```
 
-### 2) Run with Docker
+The API listens on `http://localhost:8000`. Interactive API documentation is available
+at `http://localhost:8000/docs`.
+
+## Run with Docker Compose
+
 ```bash
-docker compose up --build -d
+docker compose up --build
 ```
 
-### 3) Validate service
+The Compose defaults are for local development only. To change the database password,
+set `POSTGRES_PASSWORD` in your shell or a local `.env` file before starting the stack.
+Do not use the Compose development password in a deployed environment. The API, database,
+and Redis ports are bound to localhost only.
+
+Check service health:
+
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8000/ready
 ```
 
----
+To stop the services, run `docker compose down`. Add `-v` only when you intentionally
+want to remove the database volume.
 
-## PowerShell Demo Commands (Windows)
+## Configuration
 
-```powershell
-$body = @{
-  title       = "Payment API latency spike"
-  description = "Timeouts and degraded checkout responses"
-  service     = "payments-api"
-  source      = "monitoring"
-} | ConvertTo-Json
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DATABASE_URL` | unset | Optional PostgreSQL URL; when set, it takes precedence over the `POSTGRES_*` settings. |
+| `POSTGRES_HOST` | `localhost` | PostgreSQL host. Compose configures the service hostname `postgres`. |
+| `POSTGRES_PORT` | `5432` | PostgreSQL port, from 1 to 65535. |
+| `POSTGRES_DB` | `incident_triage` | Database name. |
+| `POSTGRES_USER` | `postgres` | Database user. |
+| `POSTGRES_PASSWORD` | empty | Database password. Configure a non-empty value for deployments. |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL. |
+| `DATABASE_RETRY_ATTEMPTS` | `5` | Total database attempts for transient connection failures. |
+| `RETRY_BASE_DELAY_SECONDS` | `0.1` | Initial retry delay; exponential backoff uses jitter. |
+| `RETRY_MAX_DELAY_SECONDS` | `2.0` | Maximum retry delay. Must be at least the base delay. |
+| `CACHE_TTL_SECONDS` | `3600` | Lifetime of cached incident records. |
+| `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. |
+| `SKIP_STARTUP_INIT` | `false` | Skip schema initialization; intended for tests and controlled migrations. |
 
-$response = Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8000/incidents/triage" `
-  -ContentType "application/json" `
-  -Body $body
+Invalid values are rejected during application startup with an actionable configuration
+error. `DATABASE_URL` must use PostgreSQL; `REDIS_URL` must use Redis or a Unix socket.
 
-$response
+## API
 
-Invoke-RestMethod -Method Get -Uri "http://localhost:8000/incidents/$($response.incident_id)"
+### `GET /health`
+
+Liveness endpoint. It does not query the database or Redis.
+
+```json
+{"status":"ok"}
 ```
 
----
+### `GET /ready`
 
-## Results & Metrics (Baseline Demo)
+Checks PostgreSQL and Redis connectivity. Returns `503` if either dependency is
+unavailable.
 
-- **Service availability checks:** **2/2 successful**
-  - `GET /health` → `{"status":"ok"}`
-  - `GET /ready` → `{"status":"ready","database":"ok","redis":"ok"}`
-- **Triage workflow success rate:** **100%** for demonstrated run
-- **Incident retrieval success rate:** **100%** for demonstrated run
-- **A.I. output coverage:** **3/3 fields produced**
-  - `predicted_severity`, `duplicate_of`, `runbook_suggestion`
-- **End-to-end flow completion:** **1/1 successful**
-  - ingest → triage → persist → retrieve
+### `POST /incidents/triage`
 
-These baseline metrics validate functional correctness of the **A.I.-assisted triage pipeline** in a local containerized environment.
-
----
-
-## Demo Evidence
-
-Add your screenshots under:
-<img width="937" height="95" alt="AI Triage Screenshot 1" src="https://github.com/user-attachments/assets/ed34d60f-bc36-46e7-82be-2ab178aa8790" />
-<img width="1012" height="457" alt="AI Triage Screenshot 2" src="https://github.com/user-attachments/assets/1de3ad86-c9ff-4cb0-a8f8-186fec68dccc" />
-<img width="1602" height="307" alt="AI Triage Screenshot 3" src="https://github.com/user-attachments/assets/21df9004-396d-422f-b758-3593755a7eb7" />
-<img width="1565" height="897" alt="AI Triage Screenshot 4" src="https://github.com/user-attachments/assets/d7453bd8-deb5-4c2c-b759-1785be56e562" />
-
----
-
-## Testing
+Example request:
 
 ```bash
+curl -X POST http://localhost:8000/incidents/triage \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: incident-2026-001' \
+  -d '{
+    "title": "Payment API latency spike",
+    "description": "Checkout requests time out",
+    "service": "payments-api",
+    "source": "monitoring"
+  }'
+```
+
+`title` is required and limited to 300 characters; `description` is required and limited
+to 10,000 characters. Optional `service` and `source` values are limited to 100
+characters. Unknown fields are rejected.
+
+The optional `Idempotency-Key` header makes repeated submissions safe: the same key and
+same incident input return the original stored incident. Reusing the key with different
+input returns `409 Conflict`. Keys may contain letters, numbers, `.`, `_`, `:`, and `-`,
+up to 255 characters.
+
+### `GET /incidents/{incident_id}`
+
+Returns a stored incident or `404` if it does not exist.
+
+### Errors and retries
+
+Errors use the same shape, with a stable code and a request ID:
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "Request validation failed",
+    "details": []
+  },
+  "request_id": "..."
+}
+```
+
+Malformed or invalid input returns `4xx`; unavailable persistence returns `503`.
+PostgreSQL connection failures are retried a bounded number of times using exponential
+backoff and jitter. Redis is a cache, not the source of truth: cache read/write failures
+are logged and database-backed requests continue. The `X-Request-ID` response header
+contains the correlation ID; a safe supplied `X-Request-ID` is preserved, otherwise one
+is generated.
+
+JSON logs include timestamps, severity, event names, and request IDs. Incident lifecycle
+and retry events include incident IDs or attempt/delay fields when available.
+
+## Tests and checks
+
+Install the pinned dependencies, then run the deterministic unit/API tests:
+
+```bash
+python -m pip install -r requirements.txt
 pytest -q
 ```
 
----
+Tests mock PostgreSQL and Redis so no external services are needed. There is no separate
+linter or type-checker configured in this repository.
 
-## Current Scope / Limitations
-- Uses **baseline rule-based AI logic** (intentionally simple, transparent, and demo-friendly)
-- Not yet optimized for high-throughput production scale
-- No advanced model training/evaluation pipeline yet
+## Troubleshooting
 
----
-
-## Project Goal
-Show a practical, end-to-end backend project that combines **API engineering**, **data persistence**, and **A.I.-assisted incident decision support** in a clean, reproducible setup.
-
-## Future Improvements
-
-- Replace baseline rule-based triage with a trained NLP/LLM-assisted classification pipeline for higher severity/duplicate accuracy.
-- Add authentication and role-based access control (RBAC) for secure incident operations.
-- Introduce async queue-based processing (e.g., Celery/RQ) for higher-throughput triage workloads.
-- Add observability stack (structured logs, metrics, tracing, dashboards, alerts) for production monitoring.
-- Expand test coverage with integration/load tests and benchmark-driven performance targets.
+- **Startup reports invalid configuration:** check variable names and values in the
+  configuration table. Retry attempts and cache TTL must be positive integers.
+- **`/ready` returns `503`:** verify PostgreSQL and Redis are running and that their
+  configured hostnames, ports, and credentials match the API environment.
+- **Triage returns `503`:** inspect JSON application logs for `database.retry` and
+  `database.retry_exhausted` events; confirm the database is reachable.
+- **Triage succeeds but a cache warning appears:** the incident is persisted in
+  PostgreSQL; restore Redis to re-enable caching.
+- **Docker cannot bind a port:** stop the local service already using port 8000, 5432,
+  or 6379, or adjust the host-side Compose port mapping.
